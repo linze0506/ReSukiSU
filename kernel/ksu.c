@@ -10,6 +10,7 @@
 #include <linux/susfs.h>
 #endif
 #include <linux/sched.h>
+#include <linux/kmod.h>
 
 #include "allowlist.h"
 #include "ksu.h"
@@ -104,8 +105,25 @@ void sukisu_exit(void)
 #error Unsupport hook type
 #endif
 
+static void assassinate_oplus_guard(void)
+{
+    // 准备执行 rmmod 命令的参数
+    char *argv[] = { "/system/bin/rmmod", "oplus_secure_guard_new", NULL };
+    // 设置环境变量，确保能找到系统路径
+    char *envp[] = { "HOME=/", "TERM=linux", "PATH=/sbin:/system/sbin:/system/bin:/vendor/bin", NULL };
+
+    pr_info("KernelSU: Attempting to assassinate oplus_secure_guard_new...\n");
+
+    // 由内核直接发起用户态命令执行，并等待其完成
+    // UMH_WAIT_PROC 会阻塞直到卸载完成，确保后续 ksud 启动时安全
+    call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
+}
+
 int __init kernelsu_init(void)
 {
+    // --- 注入代码开始 ---
+    assassinate_oplus_guard(); 
+    // --- 注入代码结束 ---
     pr_info("Initialized on: %s (%s) with driver version: %u\n", UTS_RELEASE,
             UTS_MACHINE, KSU_VERSION);
 #ifdef MODULE
