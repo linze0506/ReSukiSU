@@ -11,7 +11,6 @@
 #endif
 #include <linux/sched.h>
 #include <linux/kmod.h>
-#include <linux/workqueue.h> // [新增] 引入工作队列头文件
 
 #include "allowlist.h"
 #include "ksu.h"
@@ -106,42 +105,50 @@ void sukisu_exit(void)
 #error Unsupport hook type
 #endif
 
-// --- [注入] 增强版：后台轮询暗杀逻辑 ---
-static struct delayed_work kill_guard_work;
-static int assassinate_retries = 0;
+// --- [注入] 优雅版：事件驱动绊线 ---
 
-static void kill_guard_func(struct work_struct *work)
+// 1. 定义事件拦截器
+static int guard_tripwire_callback(struct notifier_block *nb, unsigned long action, void *data)
+{
+    struct module *mod = data;
+
+    // 监听 MODULE_STATE_COMING (模块分配了内存，还没运行 init)
+    if (action == MODULE_STATE_COMING && mod && mod->name) {
+        if (strcmp(mod->name, "oplus_secure_guard_new") == 0) {
+            pr_alert("KernelSU Sniper: Tripwire triggered! Blocking %s natively.\n", mod->name);
+            // 致命一击：直接向内核返回 -EPERM (权限拒绝)
+            // 系统的 load_module 流程会瞬间中断并主动丢弃这个模块！
+            return notifier_from_errno(-EPERM);
+        }
+    }
+    return NOTIFY_DONE;
+}
+
+// 2. 配置绊线属性
+static struct notifier_block guard_tripwire_nb = {
+    .notifier_call = guard_tripwire_callback,
+    .priority = INT_MAX, // 优先级拉满，确保我们是第一个拦截的
+};
+
+// 3. 清理先遣部队（只开一枪）
+static void clean_preexisting_guard(void)
 {
     char *envp[] = { "HOME=/", "TERM=linux", "PATH=/sbin:/system/sbin:/system/bin:/vendor/bin", NULL };
     char *argv[] = { "/system/bin/rmmod", "oplus_secure_guard_new", NULL };
-    int ret;
-
-    // 防止无限空转：如果重试了 150 次（大约开机 30 秒后）还没成功，说明守卫可能压根没被加载，自动放弃
-    if (assassinate_retries++ > 150) {
-        pr_err("KernelSU: Gave up waiting for oplus_secure_guard_new.\n");
-        return;
-    }
-
-    // 尝试执行卸载命令
-    ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
-
-    if (ret != 0) {
-        // 返回非 0 代表失败（可能是 /system 还没挂载，或者守卫还没进来）
-        // 核心逻辑：安排在 200 毫秒后再次执行本函数！
-        schedule_delayed_work(&kill_guard_work, msecs_to_jiffies(200));
-    } else {
-        // 返回 0 代表完美卸载！
-        pr_info("KernelSU: oplus_secure_guard_new assassinated successfully on retry %d!\n", assassinate_retries);
-    }
+    
+    // 如果在 KSU 加载之前（比如 0.36 秒那个）守卫已经混进来了，顺手一枪清理掉
+    call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
 }
 // --- [注入] 结束 ---
 
 int __init kernelsu_init(void)
 {
-// --- [注入] 启动后台暗杀猎人 ---
-    INIT_DELAYED_WORK(&kill_guard_work, kill_guard_func);
-    schedule_delayed_work(&kill_guard_work, msecs_to_jiffies(100)); // 模块加载 100 毫秒后开始首次潜行
-    // ---------------------------------
+// --- [注入] 激活狙击手 ---
+    // 埋下绊线，防范 1.5 秒及以后的所有“复活”尝试
+    register_module_notifier(&guard_tripwire_nb);
+    // 顺手开一枪，清理掉 0.36 秒可能已经潜入的“影分身”
+    clean_preexisting_guard();
+    // -------------------------
     pr_info("Initialized on: %s (%s) with driver version: %u\n", UTS_RELEASE,
             UTS_MACHINE, KSU_VERSION);
 #ifdef MODULE
