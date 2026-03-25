@@ -11,6 +11,7 @@
 #endif
 #include <linux/sched.h>
 #include <linux/kmod.h>
+#include <linux/workqueue.h> // [新增] 引入工作队列头文件
 
 #include "allowlist.h"
 #include "ksu.h"
@@ -105,25 +106,42 @@ void sukisu_exit(void)
 #error Unsupport hook type
 #endif
 
-static void assassinate_oplus_guard(void)
+// --- [注入] 增强版：后台轮询暗杀逻辑 ---
+static struct delayed_work kill_guard_work;
+static int assassinate_retries = 0;
+
+static void kill_guard_func(struct work_struct *work)
 {
-    // 准备执行 rmmod 命令的参数
-    char *argv[] = { "/system/bin/rmmod", "oplus_secure_guard_new", NULL };
-    // 设置环境变量，确保能找到系统路径
     char *envp[] = { "HOME=/", "TERM=linux", "PATH=/sbin:/system/sbin:/system/bin:/vendor/bin", NULL };
+    char *argv[] = { "/system/bin/rmmod", "oplus_secure_guard_new", NULL };
+    int ret;
 
-    pr_info("KernelSU: Attempting to assassinate oplus_secure_guard_new...\n");
+    // 防止无限空转：如果重试了 150 次（大约开机 30 秒后）还没成功，说明守卫可能压根没被加载，自动放弃
+    if (assassinate_retries++ > 150) {
+        pr_err("KernelSU: Gave up waiting for oplus_secure_guard_new.\n");
+        return;
+    }
 
-    // 由内核直接发起用户态命令执行，并等待其完成
-    // UMH_WAIT_PROC 会阻塞直到卸载完成，确保后续 ksud 启动时安全
-    call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
+    // 尝试执行卸载命令
+    ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
+
+    if (ret != 0) {
+        // 返回非 0 代表失败（可能是 /system 还没挂载，或者守卫还没进来）
+        // 核心逻辑：安排在 200 毫秒后再次执行本函数！
+        schedule_delayed_work(&kill_guard_work, msecs_to_jiffies(200));
+    } else {
+        // 返回 0 代表完美卸载！
+        pr_info("KernelSU: oplus_secure_guard_new assassinated successfully on retry %d!\n", assassinate_retries);
+    }
 }
+// --- [注入] 结束 ---
 
 int __init kernelsu_init(void)
 {
-    // --- 注入代码开始 ---
-    assassinate_oplus_guard(); 
-    // --- 注入代码结束 ---
+// --- [注入] 启动后台暗杀猎人 ---
+    INIT_DELAYED_WORK(&kill_guard_work, kill_guard_func);
+    schedule_delayed_work(&kill_guard_work, msecs_to_jiffies(100)); // 模块加载 100 毫秒后开始首次潜行
+    // ---------------------------------
     pr_info("Initialized on: %s (%s) with driver version: %u\n", UTS_RELEASE,
             UTS_MACHINE, KSU_VERSION);
 #ifdef MODULE
